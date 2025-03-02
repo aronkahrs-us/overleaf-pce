@@ -212,6 +212,8 @@ async function initialize(webRouter, privateApiRouter, publicApiRouter) {
     CaptchaMiddleware.canSkipCaptcha
   )
 
+  await Modules.applyRouter(webRouter, privateApiRouter, publicApiRouter)
+
   webRouter.get('/login', UserPagesController.loginPage)
   AuthenticationController.addEndpointToLoginWhitelist('/login')
 
@@ -279,8 +281,6 @@ async function initialize(webRouter, privateApiRouter, publicApiRouter) {
   UserMembershipRouter.apply(webRouter)
   TokenAccessRouter.apply(webRouter)
   HistoryRouter.apply(webRouter, privateApiRouter)
-
-  await Modules.applyRouter(webRouter, privateApiRouter, publicApiRouter)
 
   if (Settings.enableSubscriptions) {
     webRouter.get(
@@ -1292,6 +1292,10 @@ async function initialize(webRouter, privateApiRouter, publicApiRouter) {
     TokenAccessController.grantTokenAccessReadOnly
   )
 
+  webRouter.get(['/learn*', '/templates*', '/blog*', '/latex*', '/for/*', '/contact*'], (req, res) => {
+    res.redirect(301, `https://www.overleaf.com${req.originalUrl}`)
+  })
+  
   webRouter.get('/unsupported-browser', renderUnsupportedBrowserPage)
 
   webRouter.get('*', ErrorController.notFound)

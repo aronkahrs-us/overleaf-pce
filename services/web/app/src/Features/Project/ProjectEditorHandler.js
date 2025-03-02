@@ -9,7 +9,7 @@ function mergeDeletedDocs(a, b) {
 }
 
 module.exports = ProjectEditorHandler = {
-  trackChangesAvailable: false,
+  trackChangesAvailable: true,
 
   buildProjectModelView(project, members, invites, deletedDocsFromDocstore) {
     let owner, ownerFeatures
@@ -38,10 +38,7 @@ module.exports = ProjectEditorHandler = {
       ),
       members: [],
       invites: this.buildInvitesView(invites),
-      imageName:
-        project.imageName != null
-          ? Path.basename(project.imageName)
-          : undefined,
+      imageName: project.imageName,
     }
 
     ;({ owner, ownerFeatures, members } =

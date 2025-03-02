@@ -82,6 +82,7 @@ const AuthenticationController = {
       analyticsId: user.analyticsId || user._id,
       alphaProgram: user.alphaProgram || undefined, // only store if set
       betaProgram: user.betaProgram || undefined, // only store if set
+      externalAuth: user.externalAuth || false,
     }
     if (user.isAdmin) {
       lightUser.isAdmin = true
@@ -126,6 +127,7 @@ const AuthenticationController = {
             return next(err)
           }
         } else {
+          let info = infoArray[0]
           if (info.redir != null) {
             return res.json({ redir: info.redir })
           } else {
