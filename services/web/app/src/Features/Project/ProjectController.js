@@ -356,6 +356,7 @@ const _ProjectController = {
       'papers-integration',
       'editor-redesign',
       'paywall-change-compile-timeout',
+      'overleaf-assist-bundle',
     ].filter(Boolean)
 
     const getUserValues = async userId =>
@@ -756,6 +757,9 @@ const _ProjectController = {
         chatEnabled = Features.hasFeature('chat')
       }
 
+      const isOverleafAssistBundleEnabled =
+        splitTestAssignments['overleaf-assist-bundle']?.variant === 'enabled'
+
       const isPaywallChangeCompileTimeoutEnabled =
         splitTestAssignments['paywall-change-compile-timeout']?.variant ===
         'enabled'
@@ -763,6 +767,24 @@ const _ProjectController = {
       const paywallPlans =
         isPaywallChangeCompileTimeoutEnabled &&
         (await ProjectController._getPaywallPlansPrices(req, res))
+
+      const customerIoEnabled =
+        await SplitTestHandler.promises.hasUserBeenAssignedToVariant(
+          req,
+          userId,
+          'customer-io-trial-conversion',
+          'enabled',
+          true
+        )
+
+      const addonPrices =
+        isOverleafAssistBundleEnabled &&
+        (await ProjectController._getAddonPrices(req, res))
+
+      let planCode = subscription?.planCode
+      if (!planCode && !userInNonIndividualSub) {
+        planCode = 'free'
+      }
 
       res.render(template, {
         title: project.name,
@@ -793,6 +815,9 @@ const _ProjectController = {
           labsProgram: user.labsProgram,
           inactiveTutorials: TutorialHandler.getInactiveTutorials(user),
           isAdmin: hasAdminAccess(user),
+          planCode,
+          isMemberOfGroupSubscription: userIsMemberOfGroupSubscription,
+          hasInstitutionLicence: userHasInstitutionLicence,
         },
         userSettings: {
           mode: user.ace.mode,
@@ -865,7 +890,10 @@ const _ProjectController = {
           reviewerRoleAssignment?.variant === 'enabled' ||
           Object.keys(project.reviewer_refs || {}).length > 0,
         isPaywallChangeCompileTimeoutEnabled,
+        isOverleafAssistBundleEnabled,
         paywallPlans,
+        customerIoEnabled,
+        addonPrices,
       })
       timer.done()
     } catch (err) {
@@ -896,6 +924,28 @@ const _ProjectController = {
         true
       )
       plansData[plan] = formattedPlanPrice
+    })
+    return plansData
+  },
+
+  async _getAddonPrices(req, res, addonPlans = ['assistBundle']) {
+    const plansData = {}
+
+    const locale = req.i18n.language
+    const { currency } = await SubscriptionController.getRecommendedCurrency(
+      req,
+      res
+    )
+
+    addonPlans.forEach(plan => {
+      const annualPrice = Settings.localizedAddOnsPricing[currency][plan].annual
+      const monthlyPrice =
+        Settings.localizedAddOnsPricing[currency][plan].monthly
+
+      plansData[plan] = {
+        annual: formatCurrency(annualPrice, currency, locale, true),
+        monthly: formatCurrency(monthlyPrice, currency, locale, true),
+      }
     })
     return plansData
   },
@@ -1203,6 +1253,7 @@ const ProjectController = {
   _isInPercentageRollout: _ProjectController._isInPercentageRollout,
   _refreshFeatures: _ProjectController._refreshFeatures,
   _getPaywallPlansPrices: _ProjectController._getPaywallPlansPrices,
+  _getAddonPrices: _ProjectController._getAddonPrices,
 }
 
 module.exports = ProjectController

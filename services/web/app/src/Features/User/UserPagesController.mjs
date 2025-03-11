@@ -115,10 +115,6 @@ async function settingsPage(req, res) {
     )
   }
 
-  // Get the user's assignment for this page's Bootstrap 5 split test, which
-  // populates splitTestVariants with a value for the split test name and allows
-  // Pug to read it
-  await SplitTestHandler.promises.getAssignment(req, res, 'bootstrap-5')
   // Get the users write-and-cite assignment to switch between translation strings
   await SplitTestHandler.promises.getAssignment(req, res, 'write-and-cite')
   // Get the users papers-integration assignment to show the linking widget
@@ -307,7 +303,15 @@ const UserPagesController = {
     )
   },
 
-  compromisedPasswordPage(_, res) {
+  async compromisedPasswordPage(req, res) {
+    // Populates splitTestVariants with a value for the split test name and allows
+    // Pug to read it
+    await SplitTestHandler.promises.getAssignment(
+      req,
+      res,
+      'bs5-misc-pages-platform'
+    )
+
     res.render('user/compromised_password')
   },
 

@@ -37,11 +37,24 @@ import projectKey from '../lib/project_key.js'
 import Crypto from 'node:crypto'
 import Stream from 'node:stream'
 import { EventEmitter } from 'node:events'
-import { batchedUpdate } from '@overleaf/mongo-utils/batchedUpdate.js'
+import {
+  objectIdFromInput,
+  batchedUpdate,
+  READ_PREFERENCE_SECONDARY,
+} from '@overleaf/mongo-utils/batchedUpdate.js'
 import { createGunzip } from 'node:zlib'
 import { text } from 'node:stream/consumers'
 import { fromStream as blobHashFromStream } from '../lib/blob_hash.js'
 import { NotFoundError } from '@overleaf/object-persistor/src/Errors.js'
+
+// Create a singleton promise that loads global blobs once
+let globalBlobsPromise = null
+function ensureGlobalBlobsLoaded() {
+  if (!globalBlobsPromise) {
+    globalBlobsPromise = loadGlobalBlobs()
+  }
+  return globalBlobsPromise
+}
 
 EventEmitter.defaultMaxListeners = 20
 
@@ -54,6 +67,7 @@ const RETRY_DELAY = 1000
 let CONCURRENCY = 4
 let BATCH_CONCURRENCY = 1
 let BLOB_LIMITER = pLimit(CONCURRENCY)
+let USE_SECONDARY = false
 
 /**
  * Configure backup settings
@@ -65,6 +79,7 @@ export function configureBackup(options = {}) {
   CONCURRENCY = options.concurrency || 1
   BATCH_CONCURRENCY = options.batchConcurrency || 1
   BLOB_LIMITER = pLimit(CONCURRENCY)
+  USE_SECONDARY = options.useSecondary || false
 }
 
 let gracefulShutdownInitiated = false
@@ -155,7 +170,7 @@ async function backupSingleBlob(projectId, historyId, blob, tmpDir, persistor) {
     )
     return
   }
-  logger.info({ blob, historyId }, 'backing up blob')
+  logger.debug({ blob, historyId }, 'backing up blob')
   const blobPath = await downloadWithRetry(historyId, blob, tmpDir)
   await backupWithRetry(historyId, blob, blobPath, persistor)
 }
@@ -169,7 +184,8 @@ async function backupBlobs(projectId, historyId, blobs, limiter, persistor) {
       limiter(backupSingleBlob, projectId, historyId, blob, tmpDir, persistor)
     )
 
-    await Promise.allSettled(blobBackupOperations)
+    // Reject if any blob backup fails
+    await Promise.all(blobBackupOperations)
   } finally {
     if (tmpDir) {
       await fs.rm(tmpDir, { recursive: true, force: true })
@@ -199,7 +215,7 @@ async function backupChunk(
     return
   }
   const key = makeChunkKey(historyId, chunkToBackup.startVersion)
-  logger.info({ chunkRecord, historyId, projectId, key }, 'backing up chunk')
+  logger.debug({ chunkRecord, historyId, projectId, key }, 'backing up chunk')
   const md5 = Crypto.createHash('md5').update(chunkBuffer)
   await chunkBackupPersistorForProject.sendStream(
     chunksBucket,
@@ -229,7 +245,7 @@ async function updateBackupStatus(
     )
     return
   }
-  logger.info(
+  logger.debug(
     { projectId, chunkRecord, startOfBackupTime },
     'setting backupVersion and lastBackedUpTimestamp'
   )
@@ -322,6 +338,11 @@ const optionDefinitions = [
     description: 'End date for initialization (ISO format)',
   },
   {
+    name: 'use-secondary',
+    type: Boolean,
+    description: 'Use secondary read preference for backup status',
+  },
+  {
     name: 'compare',
     alias: 'C',
     type: Boolean,
@@ -378,6 +399,10 @@ function handleOptions() {
     process.exit(1)
   }
 
+  if (options['use-secondary']) {
+    USE_SECONDARY = true
+  }
+
   if (
     options.compare &&
     !options.projectId &&
@@ -407,7 +432,9 @@ async function analyseBackupStatus(projectId) {
     await getBackupStatus(projectId)
   // TODO: when we have confidence that the latestChunkMetadata always matches
   // the values from the backupStatus we can skip loading it here
-  const latestChunkMetadata = await loadLatestRaw(historyId)
+  const latestChunkMetadata = await loadLatestRaw(historyId, {
+    readOnly: Boolean(USE_SECONDARY),
+  })
   if (
     currentEndVersion &&
     currentEndVersion !== latestChunkMetadata.endVersion
@@ -497,6 +524,10 @@ function makeChunkKey(projectId, startVersion) {
 }
 
 export async function backupProject(projectId, options) {
+  if (gracefulShutdownInitiated) {
+    return
+  }
+  await ensureGlobalBlobsLoaded()
   // FIXME: flush the project first!
   // Let's assume the the flush happens externally and triggers this backup
   const backupStartTime = new Date()
@@ -512,7 +543,7 @@ export async function backupProject(projectId, options) {
   } = await analyseBackupStatus(projectId)
 
   if (upToDate) {
-    logger.info(
+    logger.debug(
       {
         projectId,
         historyId,
@@ -548,7 +579,7 @@ export async function backupProject(projectId, options) {
     return
   }
 
-  logger.info(
+  logger.debug(
     {
       projectId,
       historyId,
@@ -567,6 +598,7 @@ export async function backupProject(projectId, options) {
   )
 
   let previousBackedUpVersion = lastBackedUpVersion
+  const backupVersions = [previousBackedUpVersion]
 
   for await (const {
     blobsToBackup,
@@ -598,14 +630,23 @@ export async function backupProject(projectId, options) {
     )
 
     // persist the backup status in mongo for the current chunk
-    await updateBackupStatus(
-      projectId,
-      previousBackedUpVersion,
-      chunkRecord,
-      backupStartTime
-    )
+    try {
+      await updateBackupStatus(
+        projectId,
+        previousBackedUpVersion,
+        chunkRecord,
+        backupStartTime
+      )
+    } catch (err) {
+      logger.error(
+        { projectId, chunkRecord, err, backupVersions },
+        'error updating backup status'
+      )
+      throw err
+    }
 
     previousBackedUpVersion = chunkRecord.endVersion
+    backupVersions.push(previousBackedUpVersion)
 
     await cleanBackedUpBlobs(projectId, blobsToBackup)
   }
@@ -632,7 +673,6 @@ export async function backupProject(projectId, options) {
 }
 
 function convertToISODate(dateStr) {
-  if (!dateStr) return undefined
   // Expecting YYYY-MM-DD format
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     throw new Error('Date must be in YYYY-MM-DD format')
@@ -641,37 +681,44 @@ function convertToISODate(dateStr) {
 }
 
 export async function initializeProjects(options) {
-  const limiter = pLimit(BATCH_CONCURRENCY)
-
-  async function processBatch(batch) {
-    if (gracefulShutdownInitiated) {
-      throw new Error('graceful shutdown')
-    }
-    const batchOperations = batch.map(project =>
-      limiter(backupProject, project._id.toHexString(), options)
-    )
-    await Promise.allSettled(batchOperations)
-  }
+  await ensureGlobalBlobsLoaded()
+  let totalErrors = 0
+  let totalProjects = 0
 
   const query = {
     'overleaf.history.id': { $exists: true },
     'overleaf.backup.lastBackedUpVersion': { $exists: false },
     'overleaf.backup.pendingChangeAt': { $exists: false },
+    _id: {
+      $gte: objectIdFromInput(convertToISODate(options['start-date'])),
+      $lt: objectIdFromInput(convertToISODate(options['end-date'])),
+    },
   }
 
-  await batchedUpdate(
-    client.db().collection('projects'),
-    query,
-    processBatch,
-    {
-      _id: 1,
-    },
-    { readPreference: 'secondary' },
-    {
-      BATCH_RANGE_START: convertToISODate(options['start-date']),
-      BATCH_RANGE_END: convertToISODate(options['end-date']),
+  const cursor = client
+    .db()
+    .collection('projects')
+    .find(query, {
+      projection: { _id: 1 },
+      readPreference: READ_PREFERENCE_SECONDARY,
+    })
+
+  for await (const project of cursor) {
+    if (gracefulShutdownInitiated) {
+      console.warn('graceful shutdown: stopping project initialization')
+      break
     }
-  )
+    totalProjects++
+    const projectId = project._id.toHexString()
+    try {
+      await backupProject(projectId, options)
+    } catch (err) {
+      totalErrors++
+      logger.error({ projectId, err }, 'error backing up project')
+    }
+  }
+
+  return { errors: totalErrors, projects: totalProjects }
 }
 
 async function backupPendingProjects(options) {
@@ -920,7 +967,7 @@ async function compareAllProjects(options) {
 
 async function main() {
   const options = handleOptions()
-  await loadGlobalBlobs()
+  await ensureGlobalBlobsLoaded()
   const projectId = options.projectId
 
   if (options.status) {

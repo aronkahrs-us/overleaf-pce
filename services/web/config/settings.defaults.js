@@ -963,6 +963,7 @@ module.exports = {
     sourceEditorCompletionSources: [],
     sourceEditorSymbolPalette: ['@/features/symbol-palette/components/symbol-palette'],
     sourceEditorToolbarComponents: [],
+    mainEditorLayoutModals: [],
     langFeedbackLinkingWidgets: [],
     labsExperiments: [],
     integrationLinkingWidgets: [],

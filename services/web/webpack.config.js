@@ -143,7 +143,8 @@ module.exports = {
               cacheDirectory: true,
               configFile: path.join(__dirname, './babel.config.json'),
               plugins: [
-                process.env.REACT_REFRESH && 'react-refresh/babel',
+                process.env.REACT_REFRESH_ENABLED === 'true' &&
+                  'react-refresh/babel',
               ].filter(Boolean),
             },
           },
@@ -153,6 +154,13 @@ module.exports = {
       {
         test: /\.wasm$/,
         type: 'asset/resource',
+        generator: {
+          filename: 'js/[name]-[contenthash][ext]',
+        },
+      },
+      {
+        test: /\.txt$/,
+        type: 'asset/source',
         generator: {
           filename: 'js/[name]-[contenthash][ext]',
         },
@@ -246,8 +254,8 @@ module.exports = {
         },
       },
       {
-        // Load images (static files)
-        test: /\.(svg|gif|png|jpg|pdf)$/,
+        // Load images and videos (static files)
+        test: /\.(svg|gif|png|jpg|pdf|mp4)$/,
         type: 'asset/resource',
         generator: {
           filename: 'images/[name]-[contenthash][ext]',
