@@ -1,5 +1,4 @@
 // @ts-check
-import config from 'config'
 import OError from '@overleaf/o-error'
 import chunkStore from '../lib/chunk_store/index.js'
 import {
@@ -12,12 +11,11 @@ import { BlobStore, GLOBAL_BLOBS, makeProjectKey } from './blob_store/index.js'
 import blobHash from './blob_hash.js'
 import { NotFoundError } from '@overleaf/object-persistor/src/Errors.js'
 import logger from '@overleaf/logger'
-import { text } from 'node:stream/consumers'
-import { createGunzip } from 'node:zlib'
 import path from 'node:path'
 import projectKey from './project_key.js'
-
-const RPO = parseInt(config.get('backupRPOInMS'), 10)
+import streams from './streams.js'
+import objectPersistor from '@overleaf/object-persistor'
+import { RPO } from '../../backupVerifier/utils.mjs'
 
 /**
  * @typedef {import("@overleaf/object-persistor/src/PerProjectEncryptedS3Persistor.js").CachedPerProjectEncryptedS3Persistor} CachedPerProjectEncryptedS3Persistor
@@ -80,17 +78,23 @@ export async function verifyBlobs(historyId, hashes, projectCache) {
       })
     } catch (err) {
       if (err instanceof NotFoundError) {
-        throw new BackupCorruptedError('missing blob', { path, hash })
+        throw new BackupCorruptedMissingBlobError('missing blob', {
+          path,
+          hash,
+        })
       }
       throw err
     }
     const backupHash = await blobHash.fromStream(blob.getByteLength(), stream)
     if (backupHash !== hash) {
-      throw new BackupCorruptedError('hash mismatch for backed up blob', {
-        path,
-        hash,
-        backupHash,
-      })
+      throw new BackupCorruptedInvalidBlobError(
+        'hash mismatch for backed up blob',
+        {
+          path,
+          hash,
+          backupHash,
+        }
+      )
     }
   }
 }
@@ -123,12 +127,20 @@ async function loadChunk(historyId, startVersion, backupPersistorForProject) {
     projectKey.format(historyId),
     projectKey.pad(startVersion)
   )
-  const backupChunkStream = await backupPersistorForProject.getObjectStream(
-    chunksBucket,
-    key
-  )
-  const raw = await text(backupChunkStream.pipe(createGunzip()))
-  return JSON.parse(raw)
+  try {
+    const buf = await streams.gunzipStreamToBuffer(
+      await backupPersistorForProject.getObjectStream(chunksBucket, key)
+    )
+    return JSON.parse(buf.toString('utf-8'))
+  } catch (err) {
+    if (err instanceof objectPersistor.Errors.NotFoundError) {
+      throw new Chunk.NotPersistedError(historyId)
+    }
+    if (err instanceof Error) {
+      throw OError.tag(err, 'Failed to load chunk', { historyId, startVersion })
+    }
+    throw err
+  }
 }
 
 /**
@@ -165,7 +177,10 @@ export async function verifyProject(historyId, endTimestamp) {
         )
       } catch (err) {
         if (err instanceof Chunk.NotPersistedError) {
-          throw new BackupRPOViolationError('backup RPO violation', chunk)
+          throw new BackupRPOViolationChunkNotBackedUpError(
+            'BackupRPOviolation: chunk not backed up',
+            chunk
+          )
         }
         throw err
       }
@@ -203,25 +218,6 @@ export async function verifyProject(historyId, endTimestamp) {
 
 export class BackupCorruptedError extends OError {}
 export class BackupRPOViolationError extends OError {}
-
-export async function healthCheck() {
-  /** @type {Array<string>} */
-  const HEALTH_CHECK_BLOBS = JSON.parse(config.get('healthCheckBlobs'))
-  if (HEALTH_CHECK_BLOBS.length !== 2) {
-    throw new Error('expected 2 healthCheckBlobs')
-  }
-  if (!HEALTH_CHECK_BLOBS.some(path => path.split('/')[0].length === 24)) {
-    throw new Error('expected mongo id in healthCheckBlobs')
-  }
-  if (!HEALTH_CHECK_BLOBS.some(path => path.split('/')[0].length < 24)) {
-    throw new Error('expected postgres id in healthCheckBlobs')
-  }
-  if (HEALTH_CHECK_BLOBS.some(path => path.split('/')[1]?.length !== 40)) {
-    throw new Error('expected hash in healthCheckBlobs')
-  }
-
-  for (const path of HEALTH_CHECK_BLOBS) {
-    const [historyId, hash] = path.split('/')
-    await verifyBlob(historyId, hash)
-  }
-}
+export class BackupCorruptedMissingBlobError extends BackupCorruptedError {}
+export class BackupCorruptedInvalidBlobError extends BackupCorruptedError {}
+export class BackupRPOViolationChunkNotBackedUpError extends OError {}

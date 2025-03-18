@@ -9,8 +9,12 @@ import {
 } from './backup.mjs'
 
 const CONCURRENCY = 15
+const WARN_THRESHOLD = 2 * 60 * 60 * 1000 // warn if projects are older than this
 const redisOptions = config.get('redis.queue')
-const TIME_BUCKETS = [10, 100, 500, 1000, 5000, 10000, 30000, 60000]
+const JOB_TIME_BUCKETS = [10, 100, 500, 1000, 5000, 10000, 30000, 60000] // milliseconds
+const LAG_TIME_BUCKETS_HRS = [
+  0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2, 3, 4, 5, 6,
+] // hours
 
 // Configure backup settings to match worker concurrency
 configureBackup({ concurrency: 50, useSecondary: true })
@@ -27,12 +31,12 @@ const backupQueue = new Queue('backup', {
 
 // Log queue events
 backupQueue.on('active', job => {
-  logger.info({ job }, 'job  is now active')
+  logger.debug({ job }, 'job is now active')
 })
 
 backupQueue.on('completed', (job, result) => {
   metrics.inc('backup_worker_job', 1, { status: 'completed' })
-  logger.info({ job, result }, 'job completed')
+  logger.debug({ job, result }, 'job completed')
 })
 
 backupQueue.on('failed', (job, err) => {
@@ -41,7 +45,7 @@ backupQueue.on('failed', (job, err) => {
 })
 
 backupQueue.on('waiting', jobId => {
-  logger.info({ jobId }, 'job is waiting')
+  logger.debug({ jobId }, 'job is waiting')
 })
 
 backupQueue.on('error', error => {
@@ -69,7 +73,7 @@ backupQueue.process(CONCURRENCY, async job => {
   const { projectId, startDate, endDate } = job.data
 
   if (projectId) {
-    return await runBackup(projectId)
+    return await runBackup(projectId, job.data, job)
   } else if (startDate && endDate) {
     return await runInit(startDate, endDate)
   } else {
@@ -77,20 +81,37 @@ backupQueue.process(CONCURRENCY, async job => {
   }
 })
 
-async function runBackup(projectId) {
+async function runBackup(projectId, data, job) {
+  const { pendingChangeAt } = data
+  // record the time it takes to run the backup job
   const timer = new metrics.Timer(
     'backup_worker_job_duration',
     1,
     {},
-    TIME_BUCKETS
+    JOB_TIME_BUCKETS
   )
+  const pendingAge = Date.now() - pendingChangeAt
+  if (pendingAge > WARN_THRESHOLD) {
+    logger.warn(
+      { projectId, pendingAge, job },
+      'project has been pending for a long time'
+    )
+  }
   try {
-    logger.info({ projectId }, 'processing backup for project')
+    logger.debug({ projectId }, 'processing backup for project')
     await backupProject(projectId, {})
     metrics.inc('backup_worker_project', 1, {
       status: 'success',
     })
     timer.done()
+    // record the replication lag (time from change to backup)
+    if (pendingChangeAt) {
+      metrics.histogram(
+        'backup_worker_replication_lag_in_hours',
+        (Date.now() - pendingChangeAt) / (3600 * 1000),
+        LAG_TIME_BUCKETS_HRS
+      )
+    }
     return `backup completed ${projectId}`
   } catch (err) {
     metrics.inc('backup_worker_project', 1, { status: 'failed' })

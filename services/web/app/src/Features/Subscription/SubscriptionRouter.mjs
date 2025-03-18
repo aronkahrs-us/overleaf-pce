@@ -135,6 +135,14 @@ export default {
       SubscriptionGroupController.manuallyCollectedSubscription
     )
 
+    webRouter.get(
+      '/user/subscription/group/subtotal-limit-exceeded',
+      AuthenticationController.requireLogin(),
+      RateLimiterMiddleware.rateLimit(subscriptionRateLimiter),
+      SubscriptionGroupController.flexibleLicensingSplitTest,
+      SubscriptionGroupController.subtotalLimitExceeded
+    )
+
     // Team invites
     webRouter.get(
       '/subscription/invites/:token/',
@@ -174,12 +182,6 @@ export default {
       AuthenticationController.requireLogin(),
       RateLimiterMiddleware.rateLimit(subscriptionRateLimiter),
       SubscriptionController.previewSubscription
-    )
-    webRouter.post(
-      '/user/subscription/update',
-      AuthenticationController.requireLogin(),
-      RateLimiterMiddleware.rateLimit(subscriptionRateLimiter),
-      SubscriptionController.updateSubscription
     )
     webRouter.get(
       '/user/subscription/addon/:addOnCode/add',

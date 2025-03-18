@@ -2,7 +2,10 @@ import Queue from 'bull'
 import config from 'config'
 import commandLineArgs from 'command-line-args'
 import logger from '@overleaf/logger'
-import { listPendingBackups } from '../lib/backup_store/index.js'
+import {
+  listPendingBackups,
+  getBackupStatus,
+} from '../lib/backup_store/index.js'
 
 logger.initialize('backup-queue')
 
@@ -33,18 +36,24 @@ const optionDefinitions = [
     name: 'queue-pending',
     type: Number,
     description:
-      'Find projects with pending changes older than N minutes and add them to the queue',
+      'Find projects with pending changes older than N seconds and add them to the queue',
   },
   {
     name: 'show-pending',
     type: Number,
     description:
-      'Show count of pending projects older than N minutes without adding to queue',
+      'Show count of pending projects older than N seconds without adding to queue',
   },
   {
     name: 'limit',
     type: Number,
     description: 'Limit the number of jobs to be added',
+  },
+  {
+    name: 'interval',
+    type: Number,
+    description: 'Time in seconds to spread jobs over (default: 300)',
+    defaultValue: 300,
   },
   {
     name: 'backoff-delay',
@@ -60,6 +69,12 @@ const optionDefinitions = [
     defaultValue: 3,
   },
   {
+    name: 'warn-threshold',
+    type: Number,
+    description: 'Warn about any project exceeding this pending age',
+    defaultValue: 2 * 3600, // 2 hours
+  },
+  {
     name: 'verbose',
     alias: 'v',
     type: Boolean,
@@ -69,6 +84,7 @@ const optionDefinitions = [
 
 // Parse command line arguments
 const options = commandLineArgs(optionDefinitions)
+const WARN_THRESHOLD = options['warn-threshold']
 
 // Helper to validate date format
 function isValidDateFormat(dateStr) {
@@ -79,25 +95,20 @@ function isValidDateFormat(dateStr) {
 function validatePendingTime(option, value) {
   if (typeof value !== 'number' || value <= 0) {
     console.error(
-      `Error: --${option} requires a positive numeric TIME argument in minutes`
+      `Error: --${option} requires a positive numeric TIME argument in seconds`
     )
-    console.error(`Example: --${option} 60`)
+    console.error(`Example: --${option} 3600`)
     process.exit(1)
   }
   return value
 }
 
-// Helper to calculate minutes since a given date
-function minutesSince(date) {
-  const now = new Date()
-  const diffMs = now - date
-  return Math.floor(diffMs / (1000 * 60))
-}
-
 // Helper to format the pending time display
 function formatPendingTime(timestamp) {
-  const minutes = minutesSince(timestamp)
-  return `${timestamp.toISOString()} (${minutes} minutes ago)`
+  const now = new Date()
+  const diffMs = now - timestamp
+  const seconds = Math.floor(diffMs / 1000)
+  return `${timestamp.toISOString()} (${seconds} seconds ago)`
 }
 
 // Helper to add a job to the queue, checking for duplicates
@@ -189,17 +200,18 @@ async function addDateRangeJob(input) {
   )
 }
 
-// Process pending projects with changes older than the specified minutes
+// Process pending projects with changes older than the specified seconds
 async function processPendingProjects(
-  minutes,
+  age,
   showOnly,
   limit,
   verbose,
+  jobInterval,
   jobOpts = {}
 ) {
-  const timeIntervalMs = minutes * 60 * 1000
+  const timeIntervalMs = age * 1000
   console.log(
-    `Finding projects with pending changes older than ${minutes} minutes${showOnly ? ' (count only)' : ''}`
+    `Finding projects with pending changes older than ${age} seconds${showOnly ? ' (count only)' : ''}`
   )
 
   let count = 0
@@ -207,20 +219,37 @@ async function processPendingProjects(
   let existingCount = 0
   // Pass the limit directly to MongoDB query for better performance
   const pendingCursor = listPendingBackups(timeIntervalMs, limit)
-
+  const changeTimes = []
   for await (const project of pendingCursor) {
     const projectId = project._id.toHexString()
     const pendingAt = project.overleaf?.backup?.pendingChangeAt
-
+    if (pendingAt) {
+      changeTimes.push(pendingAt)
+      const pendingAge = Math.floor((Date.now() - pendingAt.getTime()) / 1000)
+      if (pendingAge > WARN_THRESHOLD) {
+        const backupStatus = await getBackupStatus(projectId)
+        logger.warn(
+          {
+            projectId,
+            pendingAt,
+            pendingAge,
+            backupStatus,
+            warnThreshold: WARN_THRESHOLD,
+          },
+          `pending change exceeds rpo warning threshold`
+        )
+      }
+    }
     if (showOnly && verbose) {
       console.log(
         `Project: ${projectId} (pending since: ${formatPendingTime(pendingAt)})`
       )
     } else if (!showOnly) {
+      const delay = Math.floor(Math.random() * jobInterval * 1000) // add random delay to avoid all jobs running simultaneously
       const { job, added } = await addJobWithCheck(
         backupQueue,
-        { projectId },
-        { ...jobOpts, jobId: projectId }
+        { projectId, pendingChangeAt: pendingAt.getTime() },
+        { ...jobOpts, delay, jobId: projectId }
       )
 
       if (added) {
@@ -249,6 +278,10 @@ async function processPendingProjects(
     }
   }
 
+  const oldestChange = changeTimes.reduce((min, time) =>
+    time < min ? time : min
+  )
+
   if (showOnly) {
     console.log(
       `Found ${count} projects with pending changes (not added to queue)`
@@ -257,6 +290,7 @@ async function processPendingProjects(
     console.log(`Found ${count} projects with pending changes:`)
     console.log(`  ${addedCount} jobs added to queue`)
     console.log(`  ${existingCount} jobs already existed in queue`)
+    console.log(`  Oldest pending change: ${formatPendingTime(oldestChange)}`)
   }
 }
 
@@ -308,15 +342,13 @@ async function run() {
   } else if (options.monitor) {
     setupMonitoring()
   } else if (options['queue-pending'] !== undefined) {
-    const minutes = validatePendingTime(
-      'queue-pending',
-      options['queue-pending']
-    )
+    const age = validatePendingTime('queue-pending', options['queue-pending'])
     await processPendingProjects(
-      minutes,
+      age,
       false,
       options.limit,
       options.verbose,
+      options.interval,
       {
         attempts: options.attempts,
         backoff: {
@@ -326,8 +358,8 @@ async function run() {
       }
     )
   } else if (options['show-pending'] !== undefined) {
-    const minutes = validatePendingTime('show-pending', options['show-pending'])
-    await processPendingProjects(minutes, true, options.limit, options.verbose)
+    const age = validatePendingTime('show-pending', options['show-pending'])
+    await processPendingProjects(age, true, options.limit, options.verbose)
   } else {
     console.log('Usage:')
     console.log('  --clean               Clean up completed and failed jobs')
@@ -338,12 +370,15 @@ async function run() {
     )
     console.log('  --monitor             Monitor queue events')
     console.log(
-      '  --queue-pending TIME  Find projects with changes older than TIME minutes and add them to the queue'
+      '  --queue-pending TIME  Find projects with changes older than TIME seconds and add them to the queue'
     )
     console.log(
-      '  --show-pending TIME   Show count of pending projects older than TIME minutes'
+      '  --show-pending TIME   Show count of pending projects older than TIME seconds'
     )
     console.log('  --limit N             Limit the number of jobs to be added')
+    console.log(
+      '  --interval TIME       Time interval in seconds to spread jobs over'
+    )
     console.log(
       '  --backoff-delay TIME  Backoff delay in milliseconds for failed jobs (default: 1000)'
     )
